@@ -43,6 +43,7 @@ type Request struct {
 
 	Header
 	isConnect bool
+	partial   bool // whether contains only partial request data
 	state     rqState
 	tryCnt    byte
 }
@@ -87,7 +88,7 @@ func (r *Request) tryOnce() {
 	r.tryCnt++
 }
 
-func (r *Request) tooMuchRetry() bool {
+func (r *Request) tooManyRetry() bool {
 	return r.tryCnt > 3
 }
 
@@ -430,7 +431,7 @@ func parseRequest(c *clientConn, r *Request) (err error) {
 
 	r.reset()
 	// for http parent proxy, store the original request line
-	if hasHttpParentProxy {
+	if config.hasHttpParent {
 		r.raw.Write(s)
 		r.reqLnStart = len(s)
 	}
@@ -450,7 +451,7 @@ func parseRequest(c *clientConn, r *Request) (err error) {
 	}
 	if r.Method == "CONNECT" {
 		r.isConnect = true
-		if bool(dbgRq) && verbose && !hasHttpParentProxy {
+		if bool(dbgRq) && verbose && !config.hasHttpParent {
 			r.raw.Write(s)
 		}
 	} else {
