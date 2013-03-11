@@ -52,6 +52,9 @@ type RetryError struct {
 }
 
 func isErrRetry(err error) bool {
+	if err == nil {
+		return false
+	}
 	_, ok := err.(RetryError)
 	return ok
 }
@@ -242,18 +245,16 @@ end:
 func (c *clientConn) handleRetry(r *Request, sv *serverConn, re error) error {
 	err, ok := re.(RetryError)
 	if !ok {
+		errl.Println("handleRetry should always get RetryError:", r)
 		panic("handleRetry should always get RetryError")
 	}
-	if !r.responseNotSent() {
-		debug.Printf("%v has send some response, can't retry\n", r)
-		return errShouldClose
+	if r.raw == nil && !r.isConnect {
+		errl.Println("Non CONNECT retry with request buffer released:", r)
+		panic("Non CONNECT handleRetry with request buffer released")
 	}
-	if r.raw == nil {
-		errl.Println("Retry with request buffer released:", r)
-		sendErrorPage(c, "502 request released", err.Error(),
-			genErrMsg(r, sv, "Request buffer released, can't retry. "+
-				"This shoud be a bug in COW, please report to the author."))
-		return errPageSent
+	if !r.responseNotSent() {
+		debug.Printf("%v has sent some response, can't retry\n", r)
+		return errShouldClose
 	}
 	if r.partial {
 		debug.Printf("%v partial request, can't retry\n", r)
@@ -262,20 +263,20 @@ func (c *clientConn) handleRetry(r *Request, sv *serverConn, re error) error {
 				"Refresh to retry may work."))
 		return errPageSent
 	}
-	if !r.tooManyRetry() {
-		return RetryError{errTooManyRetry}
+	if r.tooManyRetry() {
+		if sv.maybeFake() {
+			// Sometimes GFW reset will got EOF error leading to retry too many times.
+			// In that case, consider the url as temp blocked and try parent proxy.
+			siteStat.TempBlocked(r.URL)
+			r.tryCnt = 0
+			return re
+		}
+		debug.Printf("Can't retry %v tryCnt=%d\n", r, r.tryCnt)
+		sendErrorPage(c, "502 retry failed", "Can't finish HTTP request",
+			genErrMsg(r, sv, "Has tried several times."))
+		return errPageSent
 	}
-	if sv.maybeFake() {
-		// Sometimes GFW reset will got EOF error leading to retry too many times
-		// In that case, consider temp blocked and try parent proxy.
-		siteStat.TempBlocked(r.URL)
-		r.tryCnt = 0
-		return re
-	}
-	debug.Printf("Can't retry %v tryCnt=%d\n", r, r.tryCnt)
-	sendErrorPage(c, "502 retry failed", "Can't finish HTTP request",
-		genErrMsg(r, sv, "Has tried several times."))
-	return errPageSent
+	return re
 }
 
 func (c *clientConn) serve() {
@@ -294,7 +295,17 @@ func (c *clientConn) serve() {
 
 	// Refer to implementation.md for the design choices on parsing the request
 	// and response.
+	cnt := 0
 	for {
+		if c.bufRd == nil || c.buf == nil {
+			errl.Printf("%s client read buffer nil, served %d requests",
+				c.RemoteAddr(), cnt)
+			if r.URL != nil {
+				errl.Println("previous request:", &r)
+			}
+			panic("client read buffer nil")
+		}
+		cnt++
 		if err = c.getRequest(&r); err != nil {
 			sendErrorPage(c, "404 Bad request", "Bad request", err.Error())
 			return
@@ -335,29 +346,26 @@ func (c *clientConn) serve() {
 			errl.Printf("%s retry request tryCnt=%d %v\n", c.RemoteAddr(), r.tryCnt, &r)
 		}
 		if sv, err = c.getServerConn(&r); err != nil {
-			// Failed connection will send error page back to client
 			// debug.Printf("Failed to get serverConn for %s %v\n", c.RemoteAddr(), r)
-			if err == errPageSent {
+			// Failed connection will send error page back to the client.
+			// For CONNECT, the client read buffer is released in copyClient2Server,
+			// so can't go back to getRequest.
+			if err == errPageSent && !r.isConnect {
 				continue
 			}
 			return
 		}
 
 		if r.isConnect {
-			if err = sv.doConnect(&r, c); isErrRetry(err) {
+			err = sv.doConnect(&r, c)
+			sv.Close()
+			if isErrRetry(err) {
 				// connection for CONNECT is not reused, no need to remove
 				if err = c.handleRetry(&r, sv, err); isErrRetry(err) {
 					goto retry
 				}
 			}
-			// Why return after doConnect:
-			// 1. proxy can only know whether the request is finished when either
-			// the server or the client close connection
-			// 2. if the web server closes connection, the only way to
-			// tell the client this is to close client connection (proxy
-			// don't know the protocol between the client and server)
-
-			// debug.Printf("doConnect for %s to %s done\n", c.RemoteAddr(), r.URL.HostPort)
+			// debug.Printf("doConnect %s to %s done\n", c.RemoteAddr(), r.URL.HostPort)
 			return
 		}
 
@@ -671,6 +679,7 @@ func (c *clientConn) createConnection(r *Request, siteInfo *VisitCnt) (srvconn c
 			}
 			errMsg = genErrMsg(r, nil, "Direct and parent proxy connection failed, maybe blocked site.")
 		} else {
+			errl.Printf("Direct connection for %s failed, unhandled error: %v\n", r, err)
 			errMsg = genErrMsg(r, nil, "Direct connection failed, unhandled error.")
 		}
 	}
@@ -861,21 +870,21 @@ func newServerWriter(r *Request, sv *serverConn) *serverWriter {
 	return &serverWriter{r, sv}
 }
 
-func (rw *serverWriter) Write(p []byte) (int, error) {
-	if rw.rq.raw == nil {
+func (sw *serverWriter) Write(p []byte) (int, error) {
+	if sw.rq.raw == nil {
 		// buffer released
-	} else if rw.rq.raw.Len() >= 2*httpBufSize {
+	} else if sw.rq.raw.Len() >= 2*httpBufSize {
 		// Avoid using too much memory to hold request body. If a request is
 		// not buffered completely, COW can't retry and we can release memory.
 		debug.Println("request body too large, not buffering any more")
-		rw.rq.releaseBuf()
-		rw.rq.partial = true
-	} else if rw.rq.responseNotSent() {
-		rw.rq.raw.Write(p)
+		sw.rq.releaseBuf()
+		sw.rq.partial = true
+	} else if sw.rq.responseNotSent() {
+		sw.rq.raw.Write(p)
 	} else {
-		rw.rq.releaseBuf()
+		sw.rq.releaseBuf()
 	}
-	return rw.sv.Write(p)
+	return sw.sv.Write(p)
 }
 
 func copyClient2Server(c *clientConn, sv *serverConn, r *Request, srvStopped notification, done chan byte) (err error) {
@@ -912,6 +921,9 @@ func copyClient2Server(c *clientConn, sv *serverConn, r *Request, srvStopped not
 				// debug.Printf("cli->srv write buffered err: %v\n", err)
 				return
 			}
+		}
+		if debug {
+			debug.Printf("cli->srv client %s released read buffer\n", c.RemoteAddr())
 		}
 		c.releaseBuf()
 	}
@@ -977,7 +989,6 @@ func (sv *serverConn) doConnect(r *Request, c *clientConn) (err error) {
 				debug.Printf("%s Error sending CONNECT request to http proxy server: %v\n",
 					c.RemoteAddr(), err)
 			}
-			sv.Close()
 			return err
 		}
 	} else if !r.isRetry() {
@@ -986,7 +997,6 @@ func (sv *serverConn) doConnect(r *Request, c *clientConn) (err error) {
 			if debug {
 				debug.Printf("%v Error sending 200 Connecion established: %v\n", c.RemoteAddr(), err)
 			}
-			sv.Close()
 			return err
 		}
 	}
@@ -1011,10 +1021,7 @@ func (sv *serverConn) doConnect(r *Request, c *clientConn) (err error) {
 		c.Conn.Close()
 	}
 	if isErrRetry(cli2srvErr) {
-		return RetryError{cli2srvErr}
-	}
-	if isErrRetry(err) {
-		return RetryError{err}
+		return cli2srvErr
 	}
 	return
 }
